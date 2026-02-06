@@ -63,18 +63,6 @@ jobs:
             echo "Duration: ${dt}s"
             echo "RX delta: ${drx} bytes ($(fmt_bytes "${drx}"))"
           }
-
-          meter_grouped() {
-            local label="$1"
-            shift
-
-            echo "::group::${label}"
-            meter_start "${label}"
-            # Run the command(s)
-            "$@"
-            meter_end "${label}"
-            echo "::endgroup::"
-          }
           EOF
 
           # Job-level totals
@@ -107,6 +95,35 @@ jobs:
           wget -q -O - "https://raw.githubusercontent.com/rancher/k3d/main/install.sh" | bash
           k3d version
           meter_end "k3d_install"
+          echo "::endgroup::"
+
+      - name: Install kubectl + create k3d cluster (timed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/meter.sh"
+
+          echo "::group::k3d_cluster_create"
+          meter_start "k3d_cluster_create"
+
+          # Ensure kubectl exists
+          if ! command -v kubectl >/dev/null 2>&1; then
+            # Prefer distro package to avoid adding more curl/download logic
+            sudo apt-get update
+            sudo apt-get install -y kubectl
+          fi
+
+          kubectl version --client=true
+
+          # Create a cluster and wait for it to be ready
+          # --wait waits for server readiness (k3d >= v5)
+          k3d cluster create rad --wait
+
+          # Verify cluster connectivity
+          kubectl cluster-info
+          kubectl get nodes -o wide
+
+          meter_end "k3d_cluster_create"
           echo "::endgroup::"
 
       - name: rad install kubernetes (timed)
