@@ -1,0 +1,197 @@
+name: rad-kind-test
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Init meter (detect IFACE, set helpers)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IFACE="$(ip route show default | awk '{print $5}' | head -n1)"
+          if [[ -z "${IFACE}" ]]; then
+            echo "Failed to auto-detect default route interface." >&2
+            exit 1
+          fi
+
+          echo "IFACE=${IFACE}" >> "$GITHUB_ENV"
+          echo "Detected IFACE=${IFACE}"
+
+          # Persist helper functions for later steps
+          cat > "$RUNNER_TEMP/meter.sh" <<'EOF'
+          set -euo pipefail
+
+          rx_bytes() {
+            cat "/sys/class/net/${IFACE}/statistics/rx_bytes"
+          }
+
+          # Print bytes in KiB/MiB (binary units)
+          fmt_bytes() {
+            local b="${1}"
+            if (( b >= 1024 * 1024 )); then
+              awk -v b="${b}" 'BEGIN { printf "%.2f MiB", b/1024/1024 }'
+            else
+              awk -v b="${b}" 'BEGIN { printf "%.2f KiB", b/1024 }'
+            fi
+          }
+
+          meter_start() {
+            local label="$1"
+            date +%s > "$RUNNER_TEMP/${label}.t0"
+            rx_bytes > "$RUNNER_TEMP/${label}.rx0"
+          }
+
+          meter_end() {
+            local label="$1"
+            local t0 rx0 t1 rx1 dt drx
+
+            t0="$(cat "$RUNNER_TEMP/${label}.t0")"
+            rx0="$(cat "$RUNNER_TEMP/${label}.rx0")"
+            t1="$(date +%s)"
+            rx1="$(rx_bytes)"
+
+            dt="$(( t1 - t0 ))"
+            drx="$(( rx1 - rx0 ))"
+
+            echo "Duration: ${dt}s"
+            echo "RX delta: ${drx} bytes ($(fmt_bytes "${drx}"))"
+          }
+
+          meter_grouped() {
+            local label="$1"
+            shift
+
+            echo "::group::${label}"
+            meter_start "${label}"
+            # Run the command(s)
+            "$@"
+            meter_end "${label}"
+            echo "::endgroup::"
+          }
+          EOF
+
+          # Job-level totals
+          echo "$(date +%s)" > "$RUNNER_TEMP/job.t0"
+          cat "/sys/class/net/${IFACE}/statistics/rx_bytes" > "$RUNNER_TEMP/job.rx0"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Radius (rad) via install.sh (timed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/meter.sh"
+
+          echo "::group::radius_install"
+          meter_start "radius_install"
+          wget -q "https://raw.githubusercontent.com/radius-project/radius/main/deploy/install.sh" -O - | /bin/bash
+          meter_end "radius_install"
+          echo "::endgroup::"
+
+      - name: Install k3d (timed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/meter.sh"
+
+          echo "::group::k3d_install"
+          meter_start "k3d_install"
+          wget -q -O - "https://raw.githubusercontent.com/rancher/k3d/main/install.sh" | bash
+          k3d version
+          meter_end "k3d_install"
+          echo "::endgroup::"
+
+      - name: rad install kubernetes (timed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/meter.sh"
+
+          echo "::group::rad_kubernetes_install"
+          meter_start "rad_kubernetes_install"
+          rad install kubernetes
+          meter_end "rad_kubernetes_install"
+          echo "::endgroup::"
+
+      - name: Install Terraform (timed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/meter.sh"
+
+          echo "::group::terraform_install"
+          meter_start "terraform_install"
+
+          if ! command -v unzip >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y unzip
+          fi
+
+          TF_VERSION="1.7.5"
+          curl -fsSLo terraform.zip "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+          unzip -o terraform.zip
+          sudo mv terraform /usr/local/bin/terraform
+          rm -f terraform.zip
+          terraform version
+
+          meter_end "terraform_install"
+          echo "::endgroup::"
+
+      - name: Mirror Kubernetes Terraform provider (timed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/meter.sh"
+
+          echo "::group::terraform_provider_mirror"
+          meter_start "terraform_provider_mirror"
+
+          cat > main.tf <<'EOF'
+          terraform {
+            required_providers {
+              kubernetes = {
+                source = "hashicorp/kubernetes"
+              }
+            }
+          }
+
+          provider "kubernetes" {}
+          EOF
+
+          terraform init -input=false
+
+          mkdir -p ./provider-mirror
+          terraform providers mirror ./provider-mirror
+
+          echo "Provider mirror contents:"
+          find ./provider-mirror -maxdepth 6 -type f | sed 's|^\./||'
+
+          meter_end "terraform_provider_mirror"
+          echo "::endgroup::"
+
+      - name: Final totals (job duration + total rx delta)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/meter.sh"
+
+          echo "::group::FINAL TOTALS"
+          t0="$(cat "$RUNNER_TEMP/job.t0")"
+          rx0="$(cat "$RUNNER_TEMP/job.rx0")"
+          t1="$(date +%s)"
+          rx1="$(cat "/sys/class/net/${IFACE}/statistics/rx_bytes")"
+
+          dt="$(( t1 - t0 ))"
+          drx="$(( rx1 - rx0 ))"
+
+          echo "Total duration: ${dt}s"
+          echo "Total RX delta: ${drx} bytes ($(fmt_bytes "${drx}"))"
+          echo "::endgroup::"
