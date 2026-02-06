@@ -134,7 +134,7 @@ jobs:
 
           echo "::group::rad_kubernetes_install"
           meter_start "rad_kubernetes_install"
-          rad install kubernetes
+          rad install kubernetes --skip-contour-install --set dashboard.enabled=false
           meter_end "rad_kubernetes_install"
           echo "::endgroup::"
 
